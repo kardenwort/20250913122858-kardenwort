@@ -46,7 +46,7 @@ if errorlevel 1 goto :error
 
 echo.
 echo Triple word mode with GCS...
-call "%PYTHON_EXE%" "%KARDENWORT_RUNNER_SCRIPT%" --language de --type word --mode triple --de-gcs --de-gcs-pos-tags "!VERB"
+call "%PYTHON_EXE%" "%KARDENWORT_RUNNER_SCRIPT%" --language de --type word --mode triple --de-gcs
 if errorlevel 1 goto :error
 
 echo.

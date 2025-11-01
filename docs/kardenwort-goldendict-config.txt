@@ -44,6 +44,7 @@ Programs.
 --language "en"
 --text "%GDWORD%"
 --mode "single"
+--suspend
 ---
 
 ## De
@@ -80,6 +81,7 @@ Programs.
 --language "de"
 --text "%GDWORD%"
 --mode "single"
+--suspend
 ```
 
 ---
@@ -124,6 +126,7 @@ Programs.
 --de-gcs
 --de-gcs-pos-tags "NOUN PROPN ADV ADJ"
 --mode "single"
+--suspend
 ---
 
 #### - [v] | Html | De kW L
@@ -166,4 +169,17 @@ Programs.
 --de-gcs
 --de-gcs-pos-tags "!VERB"
 --mode "single"
+--suspend
 ```
+
+#### 
+
+"U:/voothi/20250825231214-spacy-env/Scripts/python.exe" ^
+"U:/voothi/20241223170748-kardenwort/src/kardenwort/core/kardenwort.py" ^
+--lemmas-per-line ^
+--language "de" ^
+--text1-file "U:/voothi/20241223170748-kardenwort/source_texts/text1.txt" ^
+--lemma-index-file "U:/voothi/20241223170748-kardenwort/data/de/deu-mixed-typical-2011-1m-words.csv" ^
+--lemma-override-file "U:/voothi/20241223170748-kardenwort/data/de/lemma_override_de.tsv" ^
+--de-dictionary-file "U:/voothi/20241223170748-kardenwort/data/de/german.dic" ^
+--de-fix-genitive

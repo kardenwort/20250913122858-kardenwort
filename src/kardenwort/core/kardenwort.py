@@ -1,4 +1,3 @@
-# src/kardenwort/core/kardenwort.py
 import sys
 import spacy
 import csv
@@ -8,12 +7,52 @@ import os
 import re
 from contextlib import redirect_stdout
 import io
+import json
+import tempfile
+import atexit
 
 try:
     from german_compound_splitter import comp_split
     GCS_AVAILABLE = True
 except ImportError:
     GCS_AVAILABLE = False
+
+# List to hold the paths of temporary files to be cleaned up on exit.
+TEMP_FILES_TO_CLEANUP = []
+
+def _cleanup_temp_files():
+    """Remove any temporary files created during execution."""
+    for f_path in TEMP_FILES_TO_CLEANUP:
+        try:
+            os.remove(f_path)
+        except OSError:
+            pass  # Ignore errors if the file doesn't exist
+
+# Register the cleanup function to be called upon script exit.
+atexit.register(_cleanup_temp_files)
+
+
+TTS_FIELD_INDICES = {
+    'source': {
+        'en': 59,
+        'us': 60,
+        'de': 61,
+        'uk': 62,
+        'ru': 63,
+    },
+    'destination': {
+        'en': 64,
+        'us': 65,
+        'de': 66,
+        'uk': 67,
+        'ru': 68,
+    }
+}
+
+def _strip_markdown_header(line):
+    """Removes Markdown header prefixes (#, ##, etc.) from a line."""
+    match = re.match(r'^(#+)\s+(.*)', line.strip())
+    return match.group(2).strip() if match else line
 
 def _format_gcs_component_case(component):
     if not component or len(component) < 2:
@@ -364,7 +403,6 @@ def get_anki_csv_header():
         "Deck"
     ]
 
-
 def generate_filename_prefix_from_text(text, word_count):
     if not text:
         return ""
@@ -553,8 +591,91 @@ def extract_lemmas_from_sentence(sentence_text, lemma_sort_index, nlp_model, de_
 
     return sorted(list(final_lemmas), key=lambda x: (x not in lemma_sort_index, lemma_sort_index.get(x, 0), x.lower()))
 
+def _write_deck_metadata(args, output_file_path, source_text_content, target_text_content=None, tertiary_text_content=None, subdeck_content_map=None):
+    if not args.anki_deck_content:
+        return
+
+    deck_descriptions = {}
+    parent_deck_name = ""
+    root_deck_prefix = ""
+
+    if args.anki_markdown_decks:
+        if args.anki_create_subdecks:
+            if args.anki_parent_deck:
+                root_deck_prefix = args.anki_parent_deck
+            elif output_file_path:
+                base_name = os.path.splitext(os.path.basename(output_file_path))[0]
+                root_deck_prefix = re.sub(r'\.(word|sentence)', '', base_name)
+        parent_deck_name = root_deck_prefix
+    else:
+        if args.anki_create_subdecks:
+            sub_deck_name = os.path.splitext(os.path.basename(output_file_path))[0]
+            if args.anki_parent_deck:
+                parent_deck_name = args.anki_parent_deck
+            else:
+                parent_deck_name = re.sub(r'\.(word|sentence)', '', sub_deck_name)
+        else:
+            parent_deck_name = os.path.splitext(os.path.basename(output_file_path))[0]
+    
+    if parent_deck_name:
+        description_parts = []
+        
+        # --- FIX START ---
+        # 1. Normalize line endings to prevent double-spacing issues in Anki's description view.
+        # 2. Add more robust checks to ensure empty/whitespace-only translation blocks are not added.
+        
+        if 'parent-source' in args.anki_deck_content and source_text_content:
+            normalized_source = source_text_content.replace('\r\n', '\n')
+            description_parts.append(normalized_source.strip())
+
+        if 'parent-translations' in args.anki_deck_content:
+            if target_text_content and target_text_content.strip():
+                normalized_target = target_text_content.replace('\r\n', '\n')
+                description_parts.append(normalized_target.strip())
+            if tertiary_text_content and tertiary_text_content.strip():
+                normalized_tertiary = tertiary_text_content.replace('\r\n', '\n')
+                description_parts.append(normalized_tertiary.strip())
+        # --- FIX END ---
+        
+        if description_parts:
+            deck_descriptions[parent_deck_name] = "\n\n---\n\n".join(description_parts)
+
+    if subdeck_content_map and ('subdeck-source' in args.anki_deck_content or 'subdeck-translations' in args.anki_deck_content):
+        for deck_name, content_data in subdeck_content_map.items():
+            if not deck_name: continue
+
+            if deck_name == parent_deck_name and parent_deck_name in deck_descriptions:
+                            continue
+
+            subdeck_description_parts = []
+            if 'subdeck-source' in args.anki_deck_content:
+                source_part = "\n".join(content_data.get('source_lines', []))
+                if source_part: subdeck_description_parts.append(source_part)
+
+            if 'subdeck-translations' in args.anki_deck_content:
+                translation1_part = "\n".join(content_data.get('translation1_lines', []))
+                if translation1_part: subdeck_description_parts.append(translation1_part)
+                
+                translation2_part = "\n".join(content_data.get('translation2_lines', []))
+                if translation2_part: subdeck_description_parts.append(translation2_part)
+
+            if subdeck_description_parts:
+                deck_descriptions[deck_name] = "\n\n---\n\n".join(subdeck_description_parts)
+
+    if not deck_descriptions:
+        return
+
+    metadata = {"deck_descriptions": deck_descriptions}
+    
+    metadata_path = os.path.splitext(output_file_path)[0] + '.json'
+    try:
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        print(f"Warning: Could not write metadata file to {metadata_path}: {e}", file=sys.stderr)
+
 def process_parallel_text_files(
-    source_text_path, lemma_sort_index, language, target_text_path, tertiary_text_path, sentence_context_size,
+    source_text_content, lemma_sort_index, language, target_text_path, tertiary_text_path, sentence_context_size,
     output_file_path, add_source_word_col, add_wordlist_col, add_sentence_index_col,
     add_header, wordlist_use_br, stdout_print_output_basename, de_gcs, gcs_automaton, de_gcs_add_parts_to_wordlist, de_dictionary, lemma_override_rules,
     de_gcs_pos_tags, args, **kwargs
@@ -568,25 +689,41 @@ def process_parallel_text_files(
     sentence_lemmas_cache = {}
     doc_cache = {}
 
-    source_text_lines_all = []
-    if "\n" in source_text_path or not os.path.exists(source_text_path):
-        source_text_lines_all = source_text_path.splitlines()
-    else:
-        with open(source_text_path, "r", encoding="utf-8") as f1: source_text_lines_all = [line.rstrip("\n") for line in f1]
+    source_text_lines_all = [line.rstrip("\n") for line in source_text_content.splitlines()]
 
-    target_content_lines = []
+    target_content_lines_all = []
     if target_text_path:
         with open(target_text_path, "r", encoding="utf-8") as f2:
-            target_content_lines = [line.rstrip("\n") for line in f2 if line.strip()]
-
-    tertiary_content_lines = []
+            target_content_lines_all = [line.rstrip("\n") for line in f2]
+    
+    tertiary_content_lines_all = []
     if tertiary_text_path:
         with open(tertiary_text_path, "r", encoding="utf-8") as f3:
-            tertiary_content_lines = [line.rstrip("\n") for line in f3 if line.strip()]
+            tertiary_content_lines_all = [line.rstrip("\n") for line in f3]
 
-    source_content_lines = [line for line in source_text_lines_all if line.strip()]
+    strip_config = {'source': False, 'translations': False}
+    if args.strip_headers is not None:
+        targets = args.strip_headers if args.strip_headers else ['all']
+        if 'all' in targets or 'source' in targets:
+            strip_config['source'] = True
+        if 'all' in targets or 'translations' in targets:
+            strip_config['translations'] = True
 
-    lemma_to_shortest_form, lemma_to_sentence_info = {}, {}
+    display_source_lines_all = [_strip_markdown_header(line) for line in source_text_lines_all] if strip_config['source'] else source_text_lines_all
+    display_target_lines_all = [_strip_markdown_header(line) for line in target_content_lines_all] if strip_config['translations'] else target_content_lines_all
+    display_tertiary_lines_all = [_strip_markdown_header(line) for line in tertiary_content_lines_all] if strip_config['translations'] else tertiary_content_lines_all
+    
+    display_source_content_lines = [line for line in display_source_lines_all if line.strip()]
+    display_target_content_lines = [line for line in display_target_lines_all if line.strip()]
+    display_tertiary_content_lines = [line for line in display_tertiary_lines_all if line.strip()]
+
+    lemma_data = {}
+    if args.deduplication_scope == 'global':
+        lemma_data = {'lemmas': {}, 'info': {}}
+    else:
+        lemma_data = []
+
+    subdeck_content_map = {}
     deck_stack = []
     header_counter = 1
     
@@ -603,15 +740,22 @@ def process_parallel_text_files(
         if root_deck_prefix:
             deck_stack.append(root_deck_prefix)
 
+    text_has_headers = any(re.match(r'^(#+)\s+', line.strip()) for line in source_text_lines_all)
     content_line_idx = -1
     active_header_line_index = -1
-    for line_index, source_line in enumerate(source_text_lines_all):
-        source_line = source_line.strip()
-        if not source_line: continue
+    first_header_encountered = False
+    placeholder_deck_created = False
 
+    for line_index, source_line_raw in enumerate(source_text_lines_all):
+        if not source_line_raw.strip(): continue
+
+        lemmas_in_sentence = {}
+        source_line_for_analysis = source_line_raw.strip()
+        
         if args.anki_markdown_decks:
-            header_match = re.match(r'^(#+)\s+(.*)', source_line)
+            header_match = re.match(r'^(#+)\s+(.*)', source_line_for_analysis)
             if header_match:
+                first_header_encountered = True
                 active_header_line_index = line_index
                 level = len(header_match.group(1))
                 title = header_match.group(2).strip()
@@ -623,16 +767,38 @@ def process_parallel_text_files(
                 if sanitized_title:
                     deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
                     header_counter += 1
-                source_line = title
+                source_line_for_analysis = title
+            elif not first_header_encountered and not placeholder_deck_created and text_has_headers:
+                title = source_line_for_analysis
+                sanitized_title = generate_filename_prefix_from_text(title, 5)
+
+                actual_level = 1 + (1 if root_deck_prefix else 0)
+                while len(deck_stack) >= actual_level:
+                    deck_stack.pop()
+                
+                if sanitized_title:
+                    deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                    header_counter += 1
+                
+                placeholder_deck_created = True
         
         content_line_idx += 1
-        source_sentence = source_line
+        source_sentence = source_line_for_analysis
         
         base_deck = "::".join(deck_stack)
         final_deck = base_deck
         if args.anki_markdown_decks and active_header_line_index in branch_header_lines:
             final_deck = f"{base_deck}::{deck_stack[-1]}"
         
+        if args.anki_deck_content and final_deck:
+            if final_deck not in subdeck_content_map:
+                subdeck_content_map[final_deck] = {'source_lines': [], 'translation1_lines': [], 'translation2_lines': []}
+            subdeck_content_map[final_deck]['source_lines'].append(source_line_raw)
+            if line_index < len(target_content_lines_all):
+                subdeck_content_map[final_deck]['translation1_lines'].append(target_content_lines_all[line_index])
+            if line_index < len(tertiary_content_lines_all):
+                subdeck_content_map[final_deck]['translation2_lines'].append(tertiary_content_lines_all[line_index])
+
         if args.anki_sentence_subdecks:
             sentence_prefix = str(content_line_idx + 1).zfill(6)
             sentence_slug = generate_filename_prefix_from_text(source_sentence, 4)
@@ -744,15 +910,41 @@ def process_parallel_text_files(
                 deduplicated_lemmas = deduplicate_lemmas(lemmas_for_current_token)
 
                 for lemma in deduplicated_lemmas:
-                    if lemma:
-                        if lemma not in lemma_to_shortest_form:
-                            lemma_to_shortest_form[lemma] = source_word_form
-                            lemma_to_sentence_info[lemma] = (content_line_idx, source_sentence, final_deck)
-                        elif len(source_word_form) < len(lemma_to_shortest_form[lemma]):
-                             lemma_to_shortest_form[lemma] = source_word_form
-                             lemma_to_sentence_info[lemma] = (content_line_idx, source_sentence, final_deck)
+                    if not lemma:
+                        continue
+                    
+                    data_entry = {
+                        'lemma': lemma,
+                        'source_word': source_word_form,
+                        'sentence_index': content_line_idx,
+                        'source_sentence': source_sentence,
+                        'deck_name': final_deck
+                    }
 
-    sorted_words = sorted(list(lemma_to_shortest_form.keys()), key=lambda word: (word not in lemma_sort_index, lemma_sort_index.get(word, 0), word.lower()))
+                    if args.deduplication_scope == 'global':
+                        is_new = lemma not in lemma_data['lemmas']
+                        if is_new:
+                            lemma_data['lemmas'][lemma] = source_word_form
+                            lemma_data['info'][lemma] = (content_line_idx, source_sentence, final_deck)
+                        elif args.prefer_shortest_form and len(source_word_form) < len(lemma_data['lemmas'][lemma]):
+                            lemma_data['lemmas'][lemma] = source_word_form
+                            lemma_data['info'][lemma] = (content_line_idx, source_sentence, final_deck)
+
+                    elif args.deduplication_scope == 'sentence':
+                        if lemma not in lemmas_in_sentence or len(source_word_form) < len(lemmas_in_sentence[lemma]['source_word']):
+                            lemmas_in_sentence[lemma] = data_entry
+                    elif args.deduplication_scope == 'none':
+                        lemma_data.append(data_entry)
+
+        if args.deduplication_scope == 'sentence':
+            lemma_data.extend(lemmas_in_sentence.values())
+
+    sorted_items = []
+    if args.deduplication_scope == 'global':
+        sorted_items = sorted(list(lemma_data['lemmas'].keys()), key=lambda word: (word not in lemma_sort_index, lemma_sort_index.get(word, 0), word.lower()))
+    else:
+        sorted_items = sorted(lemma_data, key=lambda x: (x['lemma'] not in lemma_sort_index, lemma_sort_index.get(x['lemma'], 0), x['lemma'].lower()))
+
     if output_file_path:
         full_deck_name = ""
         if args.anki_create_subdecks and not args.anki_markdown_decks:
@@ -772,44 +964,69 @@ def process_parallel_text_files(
             if add_header:
                 tsv_writer.writerow(get_anki_csv_header())
 
-            for word in sorted_words:
+            for item in sorted_items:
                 csv_row = [""] * 82
-                sentence_index, source_sentence, deck_name = lemma_to_sentence_info.get(word, (-1, "", ""))
-                if sentence_index == -1: continue
+                
+                word, source_word_col_val, sentence_index, source_sentence_for_lemmas, deck_name = "", "", -1, "", ""
+
+                if args.deduplication_scope == 'global':
+                    word = item
+                    sentence_index, source_sentence_for_lemmas, deck_name = lemma_data['info'].get(word, (-1, "", ""))
+                    if sentence_index == -1: continue
+                    source_word_col_val = lemma_data['lemmas'].get(word, '')
+                else: # sentence or none
+                    word = item['lemma']
+                    sentence_index = item['sentence_index']
+                    source_sentence_for_lemmas = item['source_sentence']
+                    deck_name = item['deck_name']
+                    source_word_col_val = item['source_word']
 
                 context_start_index, context_end_index = max(0, sentence_index - sentence_context_size), sentence_index + sentence_context_size + 1
                 
-                csv_row[5] = " ".join(line.strip() for line in source_content_lines[context_start_index:sentence_index])
-                csv_row[6] = source_sentence.strip()
-                csv_row[7] = " ".join(line.strip() for line in source_content_lines[sentence_index + 1:context_end_index])
+                csv_row[5] = " ".join(line.strip() for line in display_source_content_lines[context_start_index:sentence_index])
+                csv_row[6] = display_source_content_lines[sentence_index].strip() if sentence_index < len(display_source_content_lines) else ""
+                csv_row[7] = " ".join(line.strip() for line in display_source_content_lines[sentence_index + 1:context_end_index])
                 
                 if target_text_path:
-                    csv_row[8] = " ".join(line.strip() for line in target_content_lines[context_start_index:sentence_index])
-                    csv_row[9] = target_content_lines[sentence_index].strip() if sentence_index < len(target_content_lines) else ""
-                    csv_row[10] = " ".join(line.strip() for line in target_content_lines[sentence_index + 1:context_end_index])
+                    csv_row[8] = " ".join(line.strip() for line in display_target_content_lines[context_start_index:sentence_index])
+                    csv_row[9] = display_target_content_lines[sentence_index].strip() if sentence_index < len(display_target_content_lines) else ""
+                    csv_row[10] = " ".join(line.strip() for line in display_target_content_lines[sentence_index + 1:context_end_index])
                 
                 if tertiary_text_path:
-                    csv_row[11] = " ".join(line.strip() for line in tertiary_content_lines[context_start_index:sentence_index])
-                    csv_row[12] = tertiary_content_lines[sentence_index].strip() if sentence_index < len(tertiary_content_lines) else ""
-                    csv_row[13] = " ".join(line.strip() for line in tertiary_content_lines[sentence_index + 1:context_end_index])
+                    csv_row[11] = " ".join(line.strip() for line in display_tertiary_content_lines[context_start_index:sentence_index])
+                    csv_row[12] = display_tertiary_content_lines[sentence_index].strip() if sentence_index < len(display_tertiary_content_lines) else ""
+                    csv_row[13] = " ".join(line.strip() for line in display_tertiary_content_lines[sentence_index + 1:context_end_index])
                 
                 csv_row[0] = word
                 csv_row[1] = word
                 if add_source_word_col:
-                    csv_row[2] = lemma_to_shortest_form.get(word, '')
-                csv_row[15] = source_sentence 
+                    csv_row[2] = source_word_col_val
+
+                source_sentence_for_tsv = display_source_content_lines[sentence_index].strip() if sentence_index < len(display_source_content_lines) else ""
+                csv_row[15] = source_sentence_for_tsv 
                 if add_wordlist_col:
-                    if source_sentence not in sentence_lemmas_cache:
+                    if source_sentence_for_lemmas not in sentence_lemmas_cache:
                         wordlist_generation_args = {**kwargs, 'de_gcs': de_gcs, 'gcs_automaton': gcs_automaton, 'de_gcs_add_parts_to_wordlist': de_gcs_add_parts_to_wordlist}
-                        lemmas = extract_lemmas_from_sentence(source_sentence, lemma_sort_index, nlp, de_dictionary, lemma_override_rules, de_gcs_pos_tags, args, **wordlist_generation_args)
-                        sentence_lemmas_cache[source_sentence] = lemmas
-                    csv_row[14] = "<br>".join(sentence_lemmas_cache[source_sentence]) if wordlist_use_br else "\n".join(sentence_lemmas_cache[source_sentence])
+                        lemmas = extract_lemmas_from_sentence(source_sentence_for_lemmas, lemma_sort_index, nlp, de_dictionary, lemma_override_rules, de_gcs_pos_tags, args, **wordlist_generation_args)
+                        sentence_lemmas_cache[source_sentence_for_lemmas] = lemmas
+                    csv_row[14] = "<br>".join(sentence_lemmas_cache[source_sentence_for_lemmas]) if wordlist_use_br else "\n".join(sentence_lemmas_cache[source_sentence_for_lemmas])
                 if add_sentence_index_col:
                     csv_row[80] = str(sentence_index + 1).zfill(6)
-                if language == "de":
-                    csv_row[61] = "1"; csv_row[68] = "1"
-                elif language == "en":
-                    csv_row[59] = "1"; csv_row[68] = "1"
+                
+                source_lang_code = args.language
+                dest_lang_code = args.tts_destination_lang
+
+                source_index = TTS_FIELD_INDICES['source'].get(source_lang_code)
+                if source_index is not None:
+                    csv_row[source_index] = "1"
+                else:
+                    print(f"Warning: No source TTS field index found for language '{source_lang_code}'", file=sys.stderr)
+
+                dest_index = TTS_FIELD_INDICES['destination'].get(dest_lang_code)
+                if dest_index is not None:
+                    csv_row[dest_index] = "1"
+                else:
+                    print(f"Warning: No destination TTS field index found for language '{dest_lang_code}'", file=sys.stderr)
 
                 if args.anki_markdown_decks:
                     csv_row[81] = deck_name
@@ -817,6 +1034,19 @@ def process_parallel_text_files(
                     csv_row[81] = full_deck_name
 
                 tsv_writer.writerow(csv_row)
+        
+        target_text_content = None
+        if target_text_path and os.path.exists(target_text_path):
+            with open(target_text_path, "r", encoding="utf-8") as f:
+                target_text_content = f.read()
+
+        tertiary_text_content = None
+        if tertiary_text_path and os.path.exists(tertiary_text_path):
+            with open(tertiary_text_path, "r", encoding="utf-8") as f:
+                tertiary_text_content = f.read()
+        
+        _write_deck_metadata(args, output_file_path, source_text_content, target_text_content, tertiary_text_content, subdeck_content_map)
+
     return output_file_path
 
 def process_single_text(
@@ -837,6 +1067,7 @@ def process_single_text(
 
     text_units = []
     deck_map = {}
+    subdeck_content_map = {}
     header_counter = 1
     branch_header_lines = set()
     active_header_line_index = -1
@@ -854,11 +1085,17 @@ def process_single_text(
         if root_deck_prefix:
             deck_stack.append(root_deck_prefix)
 
-        for line_index, line in enumerate(source_lines):
-            line = line.strip()
+        text_has_headers = any(re.match(r'^(#+)\s+', line.strip()) for line in source_lines)
+        first_header_encountered = False
+        placeholder_deck_created = False
+
+        for line_index, line_raw in enumerate(source_lines):
+            line = line_raw.strip()
             if not line: continue
+            
             header_match = re.match(r'^(#+)\s+(.*)', line)
             if header_match:
+                first_header_encountered = True
                 active_header_line_index = line_index
                 level = len(header_match.group(1))
                 title = header_match.group(2).strip()
@@ -870,12 +1107,27 @@ def process_single_text(
                     deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
                     header_counter += 1
                 line = title
-            
+            elif not first_header_encountered and not placeholder_deck_created and text_has_headers:
+                title = line
+                sanitized_title = generate_filename_prefix_from_text(title, 5)
+                actual_level = 1 + (1 if root_deck_prefix else 0)
+                while len(deck_stack) >= actual_level:
+                    deck_stack.pop()
+                if sanitized_title:
+                    deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                    header_counter += 1
+                placeholder_deck_created = True
+
             base_deck = "::".join(deck_stack)
             final_deck = base_deck
             if active_header_line_index in branch_header_lines:
                 final_deck = f"{base_deck}::{deck_stack[-1]}"
-            
+
+            if args.anki_deck_content and final_deck:
+                if final_deck not in subdeck_content_map:
+                    subdeck_content_map[final_deck] = {'source_lines': []}
+                subdeck_content_map[final_deck]['source_lines'].append(line_raw)
+
             if args.anki_sentence_subdecks:
                 sentence_prefix = str(len(text_units) + 1).zfill(6)
                 sentence_slug = generate_filename_prefix_from_text(line, 4)
@@ -887,15 +1139,29 @@ def process_single_text(
             text_units.append(line)
     else:
         if is_multiline_from_file:
-            text_units = [line for line in source_lines if line.strip()]
+            text_units = [line.strip() for line in source_lines if line.strip()]
         else:
             doc = nlp(source_text)
             text_units = [sent.text for sent in doc.sents]
 
-    lemma_to_shortest_form, lemma_to_sentence_info = {}, {}
+    strip_config = {'source': False, 'translations': False}
+    if args.strip_headers is not None:
+        targets = args.strip_headers if args.strip_headers else ['all']
+        if 'all' in targets or 'source' in targets:
+            strip_config['source'] = True
+
+    display_text_units = [_strip_markdown_header(unit) for unit in text_units] if strip_config['source'] else text_units
+
+    lemma_data = {}
+    if args.deduplication_scope == 'global':
+        lemma_data = {'lemmas': {}, 'info': {}}
+    else:
+        lemma_data = []
+
     doc_cache = {}
 
     for unit_index, unit_text in enumerate(text_units):
+        lemmas_in_sentence = {}
         if unit_text not in doc_cache:
             doc_cache[unit_text] = nlp(unit_text)
         unit_doc = doc_cache[unit_text]
@@ -1002,47 +1268,83 @@ def process_single_text(
                 deduplicated_lemmas = deduplicate_lemmas(lemmas_for_current_token)
 
                 for lemma in deduplicated_lemmas:
-                    if lemma:
-                        if lemma not in lemma_to_shortest_form:
-                            lemma_to_shortest_form[lemma] = source_word_form
-                            lemma_to_sentence_info[lemma] = (unit_index, unit_text, current_deck)
-                        elif len(source_word_form) < len(lemma_to_shortest_form[lemma]):
-                             lemma_to_shortest_form[lemma] = source_word_form
-                             lemma_to_sentence_info[lemma] = (unit_index, unit_text, current_deck)
+                    if not lemma:
+                        continue
+                        
+                    data_entry = {
+                        'lemma': lemma,
+                        'source_word': source_word_form,
+                        'sentence_index': unit_index,
+                        'source_sentence': unit_text,
+                        'deck_name': current_deck
+                    }
 
-    sorted_words = sorted(list(lemma_to_shortest_form.keys()), key=lambda word: (word not in lemma_sort_index, lemma_sort_index.get(word, 0), word.lower()))
+                    if args.deduplication_scope == 'global':
+                        is_new = lemma not in lemma_data['lemmas']
+                        if is_new:
+                            lemma_data['lemmas'][lemma] = source_word_form
+                            lemma_data['info'][lemma] = (unit_index, unit_text, current_deck)
+                        elif args.prefer_shortest_form and len(source_word_form) < len(lemma_data['lemmas'][lemma]):
+                            lemma_data['lemmas'][lemma] = source_word_form
+                            lemma_data['info'][lemma] = (unit_index, unit_text, current_deck)
+                            
+                    elif args.deduplication_scope == 'sentence':
+                        if lemma not in lemmas_in_sentence or len(source_word_form) < len(lemmas_in_sentence[lemma]['source_word']):
+                            lemmas_in_sentence[lemma] = data_entry
+                    elif args.deduplication_scope == 'none':
+                        lemma_data.append(data_entry)
+
+        if args.deduplication_scope == 'sentence':
+            lemma_data.extend(lemmas_in_sentence.values())
+
+    sorted_items = []
+    if args.deduplication_scope == 'global':
+        sorted_items = sorted(list(lemma_data['lemmas'].keys()), key=lambda word: (word not in lemma_sort_index, lemma_sort_index.get(word, 0), word.lower()))
+    else:
+        sorted_items = sorted(lemma_data, key=lambda x: (x['lemma'] not in lemma_sort_index, lemma_sort_index.get(x['lemma'], 0), x['lemma'].lower()))
     
     sentence_lemmas_cache = {}
 
     if not output_file_path:
         if args.stdout_format == 'html':
             print("<table>", file=sys.stdout)
-            for word in sorted_words:
-                source_word = lemma_to_shortest_form.get(word, '')
+            for item in sorted_items:
+                word = item if args.deduplication_scope == 'global' else item['lemma']
+                source_word = lemma_data['lemmas'].get(word, '') if args.deduplication_scope == 'global' else item['source_word']
                 print(f"<tr><td>{word}</td><td>{source_word}</td></tr>", file=sys.stdout)
             print("</table>", file=sys.stdout)
         elif args.stdout_format == 'tsv':
-            for word in sorted_words:
-                source_word = lemma_to_shortest_form.get(word, '')
+            for item in sorted_items:
+                word = item if args.deduplication_scope == 'global' else item['lemma']
+                source_word = lemma_data['lemmas'].get(word, '') if args.deduplication_scope == 'global' else item['source_word']
                 print(f"{word}\t{source_word}", file=sys.stdout)
         elif args.stdout_format == 'context':
-             for word in sorted_words:
-                unit_index, source_sentence, _ = lemma_to_sentence_info.get(word, (-1, "", ""))
+             for item in sorted_items:
+                word, unit_index = "", -1
+                if args.deduplication_scope == 'global':
+                    word = item
+                    unit_index, _, _ = lemma_data['info'].get(word, (-1, "", ""))
+                else:
+                    word = item['lemma']
+                    unit_index = item['sentence_index']
+
                 if unit_index == -1: continue
                 
-                context_start_index = max(0, unit_index - args.sentence_context_size)
-                context_end_index = min(len(text_units), unit_index + args.sentence_context_size + 1)
+                source_sentence = display_text_units[unit_index].strip()
+                context_start_index = max(0, unit_index - sentence_context_size)
+                context_end_index = min(len(display_text_units), unit_index + sentence_context_size + 1)
                 
-                source_context_left = " ".join(u.strip() for u in text_units[context_start_index:unit_index])
-                source_context_right = " ".join(u.strip() for u in text_units[unit_index + 1:context_end_index])
+                source_context_left = " ".join(u.strip() for u in display_text_units[context_start_index:unit_index])
+                source_context_right = " ".join(u.strip() for u in display_text_units[unit_index + 1:context_end_index])
                 
                 print(word, file=sys.stdout)
                 if source_context_left: print(source_context_left, file=sys.stdout)
-                print(source_sentence.strip(), file=sys.stdout)
+                print(source_sentence, file=sys.stdout)
                 if source_context_right: print(source_context_right, file=sys.stdout)
                 print(file=sys.stdout)
         else:
-            for word in sorted_words:
+            for item in sorted_items:
+                word = item if args.deduplication_scope == 'global' else item['lemma']
                 print(word, file=sys.stdout)
         return None
 
@@ -1064,34 +1366,57 @@ def process_single_text(
         if add_header:
             tsv_writer.writerow(get_anki_csv_header())
 
-        for word in sorted_words:
+        for item in sorted_items:
             csv_row = [""] * 82
-            unit_index, source_sentence, deck_name = lemma_to_sentence_info.get(word, (-1, "", ""))
-            if unit_index == -1: continue
             
-            source_sentence = source_sentence.strip()
+            word, source_word_col_val, unit_index, source_sentence_for_lemmas, deck_name = "", "", -1, "", ""
+
+            if args.deduplication_scope == 'global':
+                word = item
+                unit_index, source_sentence_for_lemmas, deck_name = lemma_data['info'].get(word, (-1, "", ""))
+                if unit_index == -1: continue
+                source_word_col_val = lemma_data['lemmas'].get(word, '')
+            else: # sentence or none
+                word = item['lemma']
+                unit_index = item['sentence_index']
+                source_sentence_for_lemmas = item['source_sentence']
+                deck_name = item['deck_name']
+                source_word_col_val = item['source_word']
+            
+            source_sentence_for_tsv = display_text_units[unit_index].strip()
             context_start_index = max(0, unit_index - sentence_context_size)
-            context_end_index = min(len(text_units), unit_index + sentence_context_size + 1)
-            csv_row[5] = " ".join(u.strip() for u in text_units[context_start_index:unit_index])
-            csv_row[6] = source_sentence
-            csv_row[7] = " ".join(u.strip() for u in text_units[unit_index + 1:context_end_index])
+            context_end_index = min(len(display_text_units), unit_index + sentence_context_size + 1)
+            csv_row[5] = " ".join(u.strip() for u in display_text_units[context_start_index:unit_index])
+            csv_row[6] = source_sentence_for_tsv
+            csv_row[7] = " ".join(u.strip() for u in display_text_units[unit_index + 1:context_end_index])
             csv_row[0] = word
             csv_row[1] = word
             if add_source_word_col:
-                csv_row[2] = lemma_to_shortest_form.get(word, '')
-            csv_row[15] = source_sentence
+                csv_row[2] = source_word_col_val
+            csv_row[15] = source_sentence_for_tsv
             if add_wordlist_col:
-                if source_sentence not in sentence_lemmas_cache:
+                if source_sentence_for_lemmas not in sentence_lemmas_cache:
                     wordlist_generation_args = {**kwargs, 'de_gcs': de_gcs, 'gcs_automaton': gcs_automaton, 'de_gcs_add_parts_to_wordlist': de_gcs_add_parts_to_wordlist}
-                    lemmas = extract_lemmas_from_sentence(source_sentence, lemma_sort_index, nlp, de_dictionary, lemma_override_rules, de_gcs_pos_tags, args, **wordlist_generation_args)
-                    sentence_lemmas_cache[source_sentence] = lemmas
-                csv_row[14] = "<br>".join(sentence_lemmas_cache[source_sentence]) if wordlist_use_br else "\n".join(sentence_lemmas_cache[source_sentence])
+                    lemmas = extract_lemmas_from_sentence(source_sentence_for_lemmas, lemma_sort_index, nlp, de_dictionary, lemma_override_rules, de_gcs_pos_tags, args, **wordlist_generation_args)
+                    sentence_lemmas_cache[source_sentence_for_lemmas] = lemmas
+                csv_row[14] = "<br>".join(sentence_lemmas_cache[source_sentence_for_lemmas]) if wordlist_use_br else "\n".join(sentence_lemmas_cache[source_sentence_for_lemmas])
             if add_sentence_index_col:
                 csv_row[80] = str(unit_index + 1).zfill(6)
-            if language == "de":
-                csv_row[61] = "1"; csv_row[68] = "1"
-            elif language == "en":
-                csv_row[59] = "1"; csv_row[68] = "1"
+            
+            source_lang_code = args.language
+            dest_lang_code = args.tts_destination_lang
+
+            source_index = TTS_FIELD_INDICES['source'].get(source_lang_code)
+            if source_index is not None:
+                csv_row[source_index] = "1"
+            else:
+                print(f"Warning: No source TTS field index found for language '{source_lang_code}'", file=sys.stderr)
+
+            dest_index = TTS_FIELD_INDICES['destination'].get(dest_lang_code)
+            if dest_index is not None:
+                csv_row[dest_index] = "1"
+            else:
+                print(f"Warning: No destination TTS field index found for language '{dest_lang_code}'", file=sys.stderr)
 
             if args.anki_markdown_decks:
                 csv_row[81] = deck_name
@@ -1100,6 +1425,7 @@ def process_single_text(
 
             tsv_writer.writerow(csv_row)
 
+    _write_deck_metadata(args, output_file_path, source_text, subdeck_content_map=subdeck_content_map)
     return output_file_path
 
 def process_parallel_sentences_to_csv(
@@ -1108,22 +1434,39 @@ def process_parallel_sentences_to_csv(
 ):
     lemma_override_rules = kwargs.pop('lemma_override_rules', {})
     
+    source_text_content = ""
+    source_text_lines_all = []
     try:
-        with open(source_text_path, "r", encoding="utf-8") as f: source_text_lines_all = [line.rstrip("\n") for line in f]
-        
-        target_content_lines = []
+        source_text_content = read_text_from_file(source_text_path)
+        source_text_lines_all = [line.rstrip("\n") for line in source_text_content.splitlines()]
+
+        target_content_lines_all = []
         if target_text_path:
             with open(target_text_path, "r", encoding="utf-8") as f:
-                target_content_lines = [line.rstrip("\n") for line in f if line.strip()]
+                target_content_lines_all = [line.rstrip("\n") for line in f]
         
-        tertiary_content_lines = []
+        tertiary_content_lines_all = []
         if tertiary_text_path:
             with open(tertiary_text_path, "r", encoding="utf-8") as f:
-                tertiary_content_lines = [line.rstrip("\n") for line in f if line.strip()]
+                tertiary_content_lines_all = [line.rstrip("\n") for line in f]
     except IOError as e:
         print(f"Error reading files: {e}", file=sys.stderr); sys.exit(1)
 
-    source_content_lines = [line for line in source_text_lines_all if line.strip()]
+    strip_config = {'source': False, 'translations': False}
+    if args.strip_headers is not None:
+        targets = args.strip_headers if args.strip_headers else ['all']
+        if 'all' in targets or 'source' in targets:
+            strip_config['source'] = True
+        if 'all' in targets or 'translations' in targets:
+            strip_config['translations'] = True
+
+    display_source_lines_all = [_strip_markdown_header(line) for line in source_text_lines_all] if strip_config['source'] else source_text_lines_all
+    display_target_lines_all = [_strip_markdown_header(line) for line in target_content_lines_all] if strip_config['translations'] else target_content_lines_all
+    display_tertiary_lines_all = [_strip_markdown_header(line) for line in tertiary_content_lines_all] if strip_config['translations'] else tertiary_content_lines_all
+    
+    display_source_content_lines = [line for line in display_source_lines_all if line.strip()]
+    display_target_content_lines = [line for line in display_target_lines_all if line.strip()]
+    display_tertiary_content_lines = [line for line in display_tertiary_lines_all if line.strip()]
 
     full_deck_name = ""
     if args.anki_create_subdecks and not args.anki_markdown_decks:
@@ -1144,6 +1487,7 @@ def process_parallel_sentences_to_csv(
             tsv_writer.writerow(get_anki_csv_header())
 
         deck_stack = []
+        subdeck_content_map = {}
         header_counter = 1
         branch_header_lines = set()
         if args.anki_markdown_decks:
@@ -1158,15 +1502,21 @@ def process_parallel_sentences_to_csv(
             if root_deck_prefix:
                 deck_stack.append(root_deck_prefix)
 
+        text_has_headers = any(re.match(r'^(#+)\s+', line.strip()) for line in source_text_lines_all)
         content_line_idx = -1
         active_header_line_index = -1
-        for line_index, source_line in enumerate(source_text_lines_all):
-            source_line = source_line.strip()
-            if not source_line: continue
+        first_header_encountered = False
+        placeholder_deck_created = False
 
+        for line_index, source_line_raw in enumerate(source_text_lines_all):
+            if not source_line_raw.strip(): continue
+
+            source_line_for_analysis = source_line_raw.strip()
+            
             if args.anki_markdown_decks:
-                header_match = re.match(r'^(#+)\s+(.*)', source_line)
+                header_match = re.match(r'^(#+)\s+(.*)', source_line_for_analysis)
                 if header_match:
+                    first_header_encountered = True
                     active_header_line_index = line_index
                     level = len(header_match.group(1))
                     title = header_match.group(2).strip()
@@ -1178,62 +1528,111 @@ def process_parallel_sentences_to_csv(
                     if sanitized_title:
                         deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
                         header_counter += 1
-                    source_line = title
+                    source_line_for_analysis = title
+                elif not first_header_encountered and not placeholder_deck_created and text_has_headers:
+                    title = source_line_for_analysis
+                    sanitized_title = generate_filename_prefix_from_text(title, 5)
+
+                    actual_level = 1 + (1 if root_deck_prefix else 0)
+                    while len(deck_stack) >= actual_level:
+                        deck_stack.pop()
+                    
+                    if sanitized_title:
+                        deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                        header_counter += 1
+                    
+                    placeholder_deck_created = True
+
+            base_deck = "::".join(deck_stack)
+            final_deck_for_content = base_deck
+            if active_header_line_index in branch_header_lines:
+                final_deck_for_content = f"{base_deck}::{deck_stack[-1]}"
+
+            if args.anki_deck_content and final_deck_for_content:
+                if final_deck_for_content not in subdeck_content_map:
+                    subdeck_content_map[final_deck_for_content] = {'source_lines': [], 'translation1_lines': [], 'translation2_lines': []}
+                subdeck_content_map[final_deck_for_content]['source_lines'].append(source_line_raw)
+                if line_index < len(target_content_lines_all):
+                    subdeck_content_map[final_deck_for_content]['translation1_lines'].append(target_content_lines_all[line_index])
+                if line_index < len(tertiary_content_lines_all):
+                    subdeck_content_map[final_deck_for_content]['translation2_lines'].append(tertiary_content_lines_all[line_index])
 
             content_line_idx += 1
-            if content_line_idx >= len(target_content_lines): break
+            if content_line_idx >= len(display_source_content_lines): break
 
             csv_row = [""] * 82
-            source_sentence = source_line
-            target_sentence = target_content_lines[content_line_idx].strip()
+            source_sentence = display_source_content_lines[content_line_idx].strip()
+            target_sentence = display_target_content_lines[content_line_idx].strip() if content_line_idx < len(display_target_content_lines) else ""
             
             context_start_index = max(0, content_line_idx - sentence_context_size)
             context_end_index = content_line_idx + sentence_context_size + 1
 
             csv_row[0] = source_sentence
-            csv_row[5] = " ".join(line.strip() for line in source_content_lines[context_start_index:content_line_idx])
+            csv_row[5] = " ".join(line.strip() for line in display_source_content_lines[context_start_index:content_line_idx])
             csv_row[6] = source_sentence
-            csv_row[7] = " ".join(line.strip() for line in source_content_lines[content_line_idx + 1:context_end_index])
+            csv_row[7] = " ".join(line.strip() for line in display_source_content_lines[content_line_idx + 1:context_end_index])
             
-            csv_row[8] = " ".join(line.strip() for line in target_content_lines[context_start_index:content_line_idx])
+            csv_row[8] = " ".join(line.strip() for line in display_target_content_lines[context_start_index:content_line_idx])
             csv_row[9] = target_sentence
-            csv_row[10] = " ".join(line.strip() for line in target_content_lines[content_line_idx + 1:context_end_index])
+            csv_row[10] = " ".join(line.strip() for line in display_target_content_lines[content_line_idx + 1:context_end_index])
             
             if add_wordlist_col:
-                lemmas = extract_lemmas_from_sentence(source_sentence, lemma_sort_index, nlp, de_dictionary, lemma_override_rules, de_gcs_pos_tags, args, **kwargs)
+                lemmas = extract_lemmas_from_sentence(source_line_for_analysis, lemma_sort_index, nlp, de_dictionary, lemma_override_rules, de_gcs_pos_tags, args, **kwargs)
                 csv_row[14] = "<br>".join(lemmas) if wordlist_use_br else "\n".join(lemmas)
             csv_row[15] = source_sentence
             
-            if tertiary_text_path and content_line_idx < len(tertiary_content_lines):
-                csv_row[11] = " ".join(line.strip() for line in tertiary_content_lines[context_start_index:content_line_idx])
-                csv_row[12] = tertiary_content_lines[content_line_idx].strip()
-                csv_row[13] = " ".join(line.strip() for line in tertiary_content_lines[content_line_idx + 1:context_end_index])
+            if tertiary_text_path and content_line_idx < len(display_tertiary_content_lines):
+                csv_row[11] = " ".join(line.strip() for line in display_tertiary_content_lines[context_start_index:content_line_idx])
+                csv_row[12] = display_tertiary_content_lines[content_line_idx].strip()
+                csv_row[13] = " ".join(line.strip() for line in display_tertiary_content_lines[content_line_idx + 1:context_end_index])
             
             if add_sentence_index_col:
                 csv_row[80] = str(content_line_idx + 1).zfill(6)
-            if language == "de":
-                csv_row[61] = "1"; csv_row[68] = "1"
-            elif language == "en":
-                csv_row[59] = "1"; csv_row[68] = "1"
+
+            source_lang_code = args.language
+            dest_lang_code = args.tts_destination_lang
+
+            source_index = TTS_FIELD_INDICES['source'].get(source_lang_code)
+            if source_index is not None:
+                csv_row[source_index] = "1"
+            else:
+                print(f"Warning: No source TTS field index found for language '{source_lang_code}'", file=sys.stderr)
+
+            dest_index = TTS_FIELD_INDICES['destination'].get(dest_lang_code)
+            if dest_index is not None:
+                csv_row[dest_index] = "1"
+            else:
+                print(f"Warning: No destination TTS field index found for language '{dest_lang_code}'", file=sys.stderr)
             
             if args.anki_markdown_decks:
-                base_deck = "::".join(deck_stack)
-                final_deck = base_deck
+                final_deck_for_card = "::".join(deck_stack)
                 if active_header_line_index in branch_header_lines:
-                    final_deck = f"{base_deck}::{deck_stack[-1]}"
+                    final_deck_for_card = f"{final_deck_for_card}::{deck_stack[-1]}"
                 
                 if args.anki_sentence_subdecks:
                     sentence_prefix = str(content_line_idx + 1).zfill(6)
                     sentence_slug = generate_filename_prefix_from_text(source_sentence, 4)
                     if sentence_slug:
                         sentence_deck_name = f"{sentence_prefix}-{sentence_slug}"
-                        final_deck = f"{final_deck}::{sentence_deck_name}"
+                        final_deck_for_card = f"{final_deck_for_card}::{sentence_deck_name}"
                 
-                csv_row[81] = final_deck
+                csv_row[81] = final_deck_for_card
             elif full_deck_name:
                 csv_row[81] = full_deck_name
                 
             tsv_writer.writerow(csv_row)
+            
+    target_text_content = None
+    if target_text_path and os.path.exists(target_text_path):
+        with open(target_text_path, "r", encoding="utf-8") as f:
+            target_text_content = f.read()
+
+    tertiary_text_content = None
+    if tertiary_text_path and os.path.exists(tertiary_text_path):
+        with open(tertiary_text_path, "r", encoding="utf-8") as f:
+            tertiary_text_content = f.read()
+
+    _write_deck_metadata(args, output_file_path, source_text_content, target_text_content, tertiary_text_content, subdeck_content_map)
     return output_file_path
 
 def process_lemmas_per_line(
@@ -1275,11 +1674,13 @@ def main():
     processing_mode_group.add_argument("--type", choices=["word", "sentence"], help="Specify the processing type: 'word' for word extraction, 'sentence' for parallel sentence processing.")
     processing_mode_group.add_argument("--lemmas-per-line", action="store_true", help="Process each line of text1-file to output a single line of frequency-sorted lemmas.")
     input_output_group.add_argument("--language", default="de", choices=["de", "en"], help="The language of the text to be processed.")
+    input_output_group.add_argument("--tts-destination-lang", default="ru", help="The destination language for TTS field activation (e.g., 'ru', 'en').")
     input_output_group.add_argument("--text", help="A single string of input text to process. Mutually exclusive with --text1-file.")
     input_output_group.add_argument("--text1-file", help="Path to the primary input text file.")
     input_output_group.add_argument("--text2-file", help="Path to a parallel (translated) text file.")
     input_output_group.add_argument("--text3-file", help="Path to a third parallel text file.")
     input_output_group.add_argument("--output-file", help="Path to the output file. If not provided, results are printed to standard output.")
+    input_output_group.add_argument("--multi-text", action="store_true", help="Parse input from --text or stdin as up to three texts separated by '---'.")
 
     data_files_group = parser.add_argument_group('Data Files')
     data_files_group.add_argument("--lemma-index-file", default="", help="Path to a CSV file with lemmas, used for frequency-based sorting of the output.")
@@ -1302,6 +1703,13 @@ def main():
     output_format_group.add_argument("--anki-markdown-decks", action="store_true", help="Parse Markdown headers in source text to create a hierarchical deck structure in Anki.")
     output_format_group.add_argument("--anki-sentence-subdecks", action="store_true", help="Create a final subdeck level for each sentence. Requires --anki-markdown-decks.")
     output_format_group.add_argument("--anki-parent-deck", help="Manually specify the parent deck name, overriding the auto-generated one. Requires --anki-create-subdecks.")
+    output_format_group.add_argument("--anki-deck-content", nargs='+', choices=['parent-source', 'parent-translations', 'subdeck-source', 'subdeck-translations'], help="Adds content to the Anki deck description. 'parent-source': adds full source text to parent deck. 'subdeck-source': adds relevant source text part to each subdeck.")
+    output_format_group.add_argument(
+        "--strip-headers",
+        nargs='*',
+        choices=['all', 'source', 'translations'],
+        help="Strip Markdown headers (#) from text fields in the final TSV output. 'all': strip from source and translations. 'source': only from source. 'translations': only from translations. If the flag is present without arguments, it defaults to 'all'."
+    )
     stdout_group = parser.add_argument_group('Standard Output (STDOUT) Arguments (used only if --output is not specified)')
     output_format_group.add_argument("--stdout-format", choices=['list', 'context', 'tsv', 'html'], default='list', 
                                help="Select the output format for STDOUT if --output-file is not specified.\n"
@@ -1312,6 +1720,8 @@ def main():
 
     lemmatization_group = parser.add_argument_group('Lemmatization Control')
     lemmatization_group.add_argument("--force-proper-noun-capitalization", action="store_true", help="Force capitalization of proper noun lemmas (PROPN).")
+    lemmatization_group.add_argument("--deduplication-scope", choices=['global', 'sentence', 'none'], default='global', help="Set the scope for lemma deduplication. 'global': unique lemmas across the entire text. 'sentence': unique lemmas within each sentence. 'none': no deduplication, one entry per word occurrence.")
+    lemmatization_group.add_argument("--prefer-shortest-form", action="store_true", help="When deduplicating globally, prefer the shortest word form of a lemma, even if it appears later in the text. Default is to keep the first occurrence.")
     de_group = parser.add_argument_group('German Language Specific Arguments')
     de_group.add_argument("--de-fix-genitive", action="store_true", help="[German] Corrects genitive noun lemmas (e.g., 'Hauses' -> 'Haus') by checking against the dictionary.")
     de_group.add_argument("--de-force-noun-capitalization", action="store_true", help="[German only] Force capitalization of all noun lemmas (NOUN, PROPN) as per German orthography rules. Overrides --force-proper-noun-capitalization for German.")
@@ -1372,6 +1782,49 @@ def main():
     gcs_group.add_argument("--de-gcs-skip-merge-fractions", action="store_true", help="[GCS] Disable merging of components, outputting raw parts from dissection.")
 
     args = parser.parse_args()
+    
+    # ============================================================================
+    # --- START OF THE CRITICAL FIX ---
+    # ============================================================================
+    if args.multi_text:
+        if args.text1_file:
+            print("Warning: --multi-text is ignored when --text1-file is provided.", file=sys.stderr)
+        else:
+            input_text_combined = ""
+            if args.text:
+                input_text_combined = args.text
+            elif not sys.stdin.isatty():
+                input_text_combined = sys.stdin.read()
+
+            if input_text_combined:
+                parts = re.split(r'\s*---\s*', input_text_combined.strip())
+                text_blocks = parts[:3]
+                file_arg_names = ['text1_file', 'text2_file', 'text3_file']
+
+                # This loop now robustly handles cases with 1, 2, or 3 text blocks.
+                # It iterates exactly 3 times, ensuring text1_file, text2_file, and text3_file
+                # are ALWAYS assigned a valid (even if empty) temp file path.
+                # This satisfies the '--type sentence' validation check later on.
+                for i, arg_name in enumerate(file_arg_names):
+                    # Get text if it exists, otherwise use an empty string
+                    text_content = text_blocks[i] if i < len(text_blocks) else ""
+                    
+                    # Create a temporary file for the content (or lack thereof)
+                    fd, path = tempfile.mkstemp(suffix='.txt', text=True)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as tmp:
+                        tmp.write(text_content)
+                    
+                    # Dynamically set the argument (e.g., args.text1_file = 'path/to/temp.txt')
+                    setattr(args, arg_name, path)
+                    TEMP_FILES_TO_CLEANUP.append(path)
+                
+                # Nullify args.text so the main logic uses the new temp file paths
+                args.text = None
+            else:
+                print("Warning: --multi-text was specified but no input received from --text or stdin.", file=sys.stderr)
+    # ============================================================================
+    # --- END OF THE CRITICAL FIX ---
+    # ============================================================================
 
     ALL_POS_TAGS = {'ADJ', 'ADP', 'ADV', 'AUX', 'CCONJ', 'DET', 'INTJ', 'NOUN', 
                     'NUM', 'PART', 'PRON', 'PROPN', 'PUNCT', 'SCONJ', 'SYM', 'VERB', 'X'}
@@ -1426,21 +1879,24 @@ def main():
     processed_output_file = None
     final_output_path = args.output_file
     
+    source_text_for_filename = ""
+    # We must now check text1_file first, as args.text is nullified by the multi-text logic
+    if args.text1_file:
+        try:
+            with open(args.text1_file, 'r', encoding='utf-8') as f:
+                source_text_for_filename = f.read(1024)
+        except Exception as e:
+            print(f"Warning: Could not read {args.text1_file} for autonaming: {e}", file=sys.stderr)
+    elif args.text:
+         source_text_for_filename = args.text
+
+
     if args.output_file and (args.basename_add_timestamp or args.basename_add_first_words is not None):
         timestamp_id = datetime.now().strftime('%Y%m%d%H%M%S')
         output_directory, filename = os.path.dirname(args.output_file) or '.', os.path.basename(args.output_file)
 
         if args.basename_add_first_words is not None:
-            text_for_filename_prefix = ""
-            if args.text:
-                text_for_filename_prefix = args.text
-            elif args.text1_file:
-                try:
-                    with open(args.text1_file, 'r', encoding='utf-8') as f:
-                        text_for_filename_prefix = f.read(1024)
-                except Exception as e:
-                    print(f"Warning: Could not read {args.text1_file} for autonaming: {e}", file=sys.stderr)
-            filename_prefix = generate_filename_prefix_from_text(text_for_filename_prefix, args.basename_add_first_words)
+            filename_prefix = generate_filename_prefix_from_text(source_text_for_filename, args.basename_add_first_words)
             if filename_prefix:
                 extension_dot_position = filename.find('.')
                 file_extension = filename[extension_dot_position:] if extension_dot_position != -1 else ""
@@ -1464,21 +1920,20 @@ def main():
         )
             
     elif args.type == "word":
-        if args.text and args.text1_file:
-            print("Error: --text and --text1-file are mutually exclusive.", file=sys.stderr); exit(1)
-
         input_text = ""
-        if args.text:
-            input_text = args.text
-        elif args.text1_file:
+        # The multi-text logic above now handles converting --text to --text1-file
+        if args.text1_file:
             input_text = read_text_from_file(args.text1_file)
+        elif args.text:
+            input_text = args.text
         elif 'KARDENWORT_INPUT_TEXT' in os.environ:
             input_text = os.environ['KARDENWORT_INPUT_TEXT']
         elif not sys.stdin.isatty():
             input_text = sys.stdin.read()
 
-        if not input_text:
+        if not input_text and not args.text2_file:
             print("Error: No input provided. Use --text, --text1-file, environment variable, or pipe data via stdin.", file=sys.stderr); exit(1)
+
         processing_options = {
             'de_gcs_only_nouns': (args.de_gcs_split_mode == 'only-nouns'),
             'de_gcs_combine_noun_modes': (args.de_gcs_split_mode == 'combined'),
@@ -1487,9 +1942,12 @@ def main():
             'de_gcs_preserve_compound_word': args.de_gcs_preserve_compound_word,
             'de_gcs_skip_merge_fractions': args.de_gcs_skip_merge_fractions,
         }
-
+        
         if args.text2_file:
-            processed_output_file = process_parallel_text_files(
+             if not input_text:
+                input_text = read_text_from_file(args.text1_file)
+
+             processed_output_file = process_parallel_text_files(
                 input_text, lemma_index, args.language, args.text2_file, args.text3_file,
                 args.sentence_context_size, final_output_path,
                 args.add_source_word_col, args.add_wordlist_col, args.add_sentence_index_col,
@@ -1498,6 +1956,8 @@ def main():
                 args.de_gcs_pos_tags, args, **processing_options
             )
         else:
+             if not input_text:
+                 print("Error: No input provided for single text processing.", file=sys.stderr); exit(1)
              processed_output_file = process_single_text(
                 input_text, lemma_index, args.language, args.sentence_context_size,
                 final_output_path, args.add_source_word_col, args.add_wordlist_col, args.add_sentence_index_col,
@@ -1509,6 +1969,7 @@ def main():
     elif args.type == "sentence":
         if any([args.de_gcs, args.de_gcs_mask_unknown_parts]):
             print("Warning: GCS-related flags are only applicable for --type word and will be ignored.", file=sys.stderr)
+        
         if not args.text1_file or not args.text2_file:
             print("Error: --text1-file and --text2-file must be specified for sentence mode.", file=sys.stderr); exit(1)
         

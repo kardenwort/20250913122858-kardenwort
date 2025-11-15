@@ -31,12 +31,11 @@ set "KARDENWORT_RUNNER_SCRIPT=%CFG_kardenwort_workspace%/%CFG_source_code_dir%/%
 :: ============================================================================
 echo Running extraction in different modes...
 
-set "EXTRA_DECK_ARGS=--tts-destination-lang ru --anki-create-subdecks --anki-markdown-decks --anki-sentence-subdecks --suspend-cards"
-set "FIRST_RUN_ARGS=--anki-deck-content parent-source parent-translations subdeck-source subdeck-translations"
+set "EXTRA_DECK_ARGS=--anki-create-subdecks --anki-markdown-decks --anki-sentence-subdecks"
 
 echo.
 echo Triple sentence mode...
-for /f "delims=" %%F in ('call "%PYTHON_EXE%" "%KARDENWORT_RUNNER_SCRIPT%" --language en --type sentence --mode triple %EXTRA_DECK_ARGS% %FIRST_RUN_ARGS%') do (
+for /f "delims=" %%F in ('call "%PYTHON_EXE%" "%KARDENWORT_RUNNER_SCRIPT%" --language de --type sentence --mode triple %EXTRA_DECK_ARGS% --de-gcs --de-gcs-pos-tags "!VERB" --suspend-cards') do (
     set "SENTENCE_FILENAME=%%F"
 )
 
@@ -52,7 +51,7 @@ echo Parent Deck Name for this session is: %PARENT_DECK_NAME%
 
 echo.
 echo Triple word mode...
-call "%PYTHON_EXE%" "%KARDENWORT_RUNNER_SCRIPT%" --language en --type word --mode triple %EXTRA_DECK_ARGS% --anki-parent-deck "%PARENT_DECK_NAME%"
+call "%PYTHON_EXE%" "%KARDENWORT_RUNNER_SCRIPT%" --language de --type word --mode triple %EXTRA_DECK_ARGS% --anki-parent-deck "%PARENT_DECK_NAME%" --de-gcs --de-gcs-pos-tags "!VERB" --suspend-cards
 if errorlevel 1 goto :error
 
 echo.

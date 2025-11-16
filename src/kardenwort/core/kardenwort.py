@@ -227,7 +227,7 @@ def get_overridden_lemma_for_compound_part(initial_lemma, part, original_word, o
 
     for source_word_regex, override_rule in override_rules.get('priority2_regex', []):
         try:
-            if re.fullmatch(source_word_regex, part):
+            if re.fullmatch(source_word_regex, original_word):
                 matched_lemma_from_regex2 = find_matching_override_in_context([override_rule], context_sentence)
                 if matched_lemma_from_regex2 is not None:
                     return matched_lemma_from_regex2
@@ -620,10 +620,6 @@ def _write_deck_metadata(args, output_file_path, source_text_content, target_tex
     if parent_deck_name:
         description_parts = []
         
-        # --- FIX START ---
-        # 1. Normalize line endings to prevent double-spacing issues in Anki's description view.
-        # 2. Add more robust checks to ensure empty/whitespace-only translation blocks are not added.
-        
         if 'parent-source' in args.anki_deck_content and source_text_content:
             normalized_source = source_text_content.replace('\r\n', '\n')
             description_parts.append(normalized_source.strip())
@@ -635,7 +631,6 @@ def _write_deck_metadata(args, output_file_path, source_text_content, target_tex
             if tertiary_text_content and tertiary_text_content.strip():
                 normalized_tertiary = tertiary_text_content.replace('\r\n', '\n')
                 description_parts.append(normalized_tertiary.strip())
-        # --- FIX END ---
         
         if description_parts:
             deck_descriptions[parent_deck_name] = "\n\n---\n\n".join(description_parts)
@@ -725,6 +720,7 @@ def process_parallel_text_files(
 
     subdeck_content_map = {}
     deck_stack = []
+    level_stack = []
     header_counter = 1
     
     branch_header_lines = set()
@@ -739,8 +735,18 @@ def process_parallel_text_files(
                 root_deck_prefix = re.sub(r'\.(word|sentence)', '', base_name)
         if root_deck_prefix:
             deck_stack.append(root_deck_prefix)
+            level_stack.append(0)
 
     text_has_headers = any(re.match(r'^(#+)\s+', line.strip()) for line in source_text_lines_all)
+    
+    first_real_header_level = 2 
+    if text_has_headers:
+        for line in source_text_lines_all:
+            match = re.match(r'^(#+)', line.strip())
+            if match:
+                first_real_header_level = len(match.group(1))
+                break
+
     content_line_idx = -1
     active_header_line_index = -1
     first_header_encountered = False
@@ -761,23 +767,28 @@ def process_parallel_text_files(
                 title = header_match.group(2).strip()
                 sanitized_title = generate_filename_prefix_from_text(title, 5)
 
-                actual_level = level + (1 if root_deck_prefix else 0)
-                while len(deck_stack) >= actual_level:
-                    deck_stack.pop()
-                if sanitized_title:
-                    deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
-                    header_counter += 1
-                source_line_for_analysis = title
-            elif not first_header_encountered and not placeholder_deck_created and text_has_headers:
-                title = source_line_for_analysis
-                sanitized_title = generate_filename_prefix_from_text(title, 5)
-
-                actual_level = 1 + (1 if root_deck_prefix else 0)
-                while len(deck_stack) >= actual_level:
+                while level_stack and level_stack[-1] >= level:
+                    level_stack.pop()
                     deck_stack.pop()
                 
                 if sanitized_title:
                     deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                    level_stack.append(level)
+                    header_counter += 1
+                source_line_for_analysis = title
+            elif not first_header_encountered and not placeholder_deck_created and text_has_headers:
+                level = first_real_header_level
+                
+                while level_stack and level_stack[-1] >= level:
+                    level_stack.pop()
+                    deck_stack.pop()
+
+                title = source_line_for_analysis
+                sanitized_title = generate_filename_prefix_from_text(title, 5)
+                
+                if sanitized_title:
+                    deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                    level_stack.append(level)
                     header_counter += 1
                 
                 placeholder_deck_created = True
@@ -1075,6 +1086,7 @@ def process_single_text(
     if args.anki_markdown_decks and is_multiline_from_file:
         branch_header_lines = parse_markdown_for_branch_headers(source_lines)
         deck_stack = []
+        level_stack = []
         root_deck_prefix = ""
         if args.anki_create_subdecks:
             if args.anki_parent_deck:
@@ -1084,8 +1096,18 @@ def process_single_text(
                 root_deck_prefix = re.sub(r'\.(word|sentence)', '', base_name)
         if root_deck_prefix:
             deck_stack.append(root_deck_prefix)
+            level_stack.append(0)
 
         text_has_headers = any(re.match(r'^(#+)\s+', line.strip()) for line in source_lines)
+        
+        first_real_header_level = 2 
+        if text_has_headers:
+            for line in source_lines:
+                match = re.match(r'^(#+)', line.strip())
+                if match:
+                    first_real_header_level = len(match.group(1))
+                    break
+
         first_header_encountered = False
         placeholder_deck_created = False
 
@@ -1100,21 +1122,29 @@ def process_single_text(
                 level = len(header_match.group(1))
                 title = header_match.group(2).strip()
                 sanitized_title = generate_filename_prefix_from_text(title, 5)
-                actual_level = level + (1 if root_deck_prefix else 0)
-                while len(deck_stack) >= actual_level:
+
+                while level_stack and level_stack[-1] >= level:
+                    level_stack.pop()
                     deck_stack.pop()
+
                 if sanitized_title:
                     deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                    level_stack.append(level)
                     header_counter += 1
                 line = title
             elif not first_header_encountered and not placeholder_deck_created and text_has_headers:
+                level = first_real_header_level
+                
+                while level_stack and level_stack[-1] >= level:
+                    level_stack.pop()
+                    deck_stack.pop()
+
                 title = line
                 sanitized_title = generate_filename_prefix_from_text(title, 5)
-                actual_level = 1 + (1 if root_deck_prefix else 0)
-                while len(deck_stack) >= actual_level:
-                    deck_stack.pop()
+
                 if sanitized_title:
                     deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                    level_stack.append(level)
                     header_counter += 1
                 placeholder_deck_created = True
 
@@ -1487,6 +1517,7 @@ def process_parallel_sentences_to_csv(
             tsv_writer.writerow(get_anki_csv_header())
 
         deck_stack = []
+        level_stack = []
         subdeck_content_map = {}
         header_counter = 1
         branch_header_lines = set()
@@ -1501,8 +1532,18 @@ def process_parallel_sentences_to_csv(
                     root_deck_prefix = re.sub(r'\.(word|sentence)', '', base_name)
             if root_deck_prefix:
                 deck_stack.append(root_deck_prefix)
+                level_stack.append(0)
 
         text_has_headers = any(re.match(r'^(#+)\s+', line.strip()) for line in source_text_lines_all)
+        
+        first_real_header_level = 2 
+        if text_has_headers:
+            for line in source_text_lines_all:
+                match = re.match(r'^(#+)', line.strip())
+                if match:
+                    first_real_header_level = len(match.group(1))
+                    break
+        
         content_line_idx = -1
         active_header_line_index = -1
         first_header_encountered = False
@@ -1522,23 +1563,28 @@ def process_parallel_sentences_to_csv(
                     title = header_match.group(2).strip()
                     sanitized_title = generate_filename_prefix_from_text(title, 5)
 
-                    actual_level = level + (1 if root_deck_prefix else 0)
-                    while len(deck_stack) >= actual_level:
+                    while level_stack and level_stack[-1] >= level:
+                        level_stack.pop()
                         deck_stack.pop()
+
                     if sanitized_title:
                         deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                        level_stack.append(level)
                         header_counter += 1
                     source_line_for_analysis = title
                 elif not first_header_encountered and not placeholder_deck_created and text_has_headers:
+                    level = first_real_header_level
+                    
+                    while level_stack and level_stack[-1] >= level:
+                        level_stack.pop()
+                        deck_stack.pop()
+
                     title = source_line_for_analysis
                     sanitized_title = generate_filename_prefix_from_text(title, 5)
-
-                    actual_level = 1 + (1 if root_deck_prefix else 0)
-                    while len(deck_stack) >= actual_level:
-                        deck_stack.pop()
                     
                     if sanitized_title:
                         deck_stack.append(f"{100000 + header_counter}-{sanitized_title}")
+                        level_stack.append(level)
                         header_counter += 1
                     
                     placeholder_deck_created = True
@@ -1720,7 +1766,7 @@ def main():
 
     lemmatization_group = parser.add_argument_group('Lemmatization Control')
     lemmatization_group.add_argument("--force-proper-noun-capitalization", action="store_true", help="Force capitalization of proper noun lemmas (PROPN).")
-    lemmatization_group.add_argument("--deduplication-scope", choices=['global', 'sentence', 'none'], default='global', help="Set the scope for lemma deduplication. 'global': unique lemmas across the entire text. 'sentence': unique lemmas within each sentence. 'none': no deduplication, one entry per word occurrence.")
+    lemmatization_group.add_argument("--deduplication-scope", choices=['global', 'sentence', 'none'], default='global', help="Set the scope for lemma deduplication. 'global': unique lemmas across the entire text. 'sentence': unique lemmas within each sentence. 'none': no duplication, one entry per word occurrence.")
     lemmatization_group.add_argument("--prefer-shortest-form", action="store_true", help="When deduplicating globally, prefer the shortest word form of a lemma, even if it appears later in the text. Default is to keep the first occurrence.")
     de_group = parser.add_argument_group('German Language Specific Arguments')
     de_group.add_argument("--de-fix-genitive", action="store_true", help="[German] Corrects genitive noun lemmas (e.g., 'Hauses' -> 'Haus') by checking against the dictionary.")
@@ -1783,9 +1829,6 @@ def main():
 
     args = parser.parse_args()
     
-    # ============================================================================
-    # --- START OF THE CRITICAL FIX ---
-    # ============================================================================
     if args.multi_text:
         if args.text1_file:
             print("Warning: --multi-text is ignored when --text1-file is provided.", file=sys.stderr)
@@ -1801,30 +1844,19 @@ def main():
                 text_blocks = parts[:3]
                 file_arg_names = ['text1_file', 'text2_file', 'text3_file']
 
-                # This loop now robustly handles cases with 1, 2, or 3 text blocks.
-                # It iterates exactly 3 times, ensuring text1_file, text2_file, and text3_file
-                # are ALWAYS assigned a valid (even if empty) temp file path.
-                # This satisfies the '--type sentence' validation check later on.
                 for i, arg_name in enumerate(file_arg_names):
-                    # Get text if it exists, otherwise use an empty string
                     text_content = text_blocks[i] if i < len(text_blocks) else ""
                     
-                    # Create a temporary file for the content (or lack thereof)
                     fd, path = tempfile.mkstemp(suffix='.txt', text=True)
                     with os.fdopen(fd, 'w', encoding='utf-8') as tmp:
                         tmp.write(text_content)
                     
-                    # Dynamically set the argument (e.g., args.text1_file = 'path/to/temp.txt')
                     setattr(args, arg_name, path)
                     TEMP_FILES_TO_CLEANUP.append(path)
                 
-                # Nullify args.text so the main logic uses the new temp file paths
                 args.text = None
             else:
                 print("Warning: --multi-text was specified but no input received from --text or stdin.", file=sys.stderr)
-    # ============================================================================
-    # --- END OF THE CRITICAL FIX ---
-    # ============================================================================
 
     ALL_POS_TAGS = {'ADJ', 'ADP', 'ADV', 'AUX', 'CCONJ', 'DET', 'INTJ', 'NOUN', 
                     'NUM', 'PART', 'PRON', 'PROPN', 'PUNCT', 'SCONJ', 'SYM', 'VERB', 'X'}
@@ -1880,7 +1912,6 @@ def main():
     final_output_path = args.output_file
     
     source_text_for_filename = ""
-    # We must now check text1_file first, as args.text is nullified by the multi-text logic
     if args.text1_file:
         try:
             with open(args.text1_file, 'r', encoding='utf-8') as f:
@@ -1921,7 +1952,6 @@ def main():
             
     elif args.type == "word":
         input_text = ""
-        # The multi-text logic above now handles converting --text to --text1-file
         if args.text1_file:
             input_text = read_text_from_file(args.text1_file)
         elif args.text:
